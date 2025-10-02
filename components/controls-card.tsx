@@ -39,7 +39,7 @@ export function ControlsCard({ language, setLanguage, sentence, onClear }: Props
             className={[
               "w-full rounded-md border border-white/40 bg-white/70 backdrop-blur px-3 py-2",
               "text-neutral-800 outline-none",
-              "focus:ring-2 focus:ring-[#007AFF]/40",
+              "focus:ring-2 focus:ring-[#10B981]/40",
             ].join(" ")}
             aria-label="Select language"
           >
@@ -59,7 +59,7 @@ export function ControlsCard({ language, setLanguage, sentence, onClear }: Props
               "transition-transform duration-150",
               "active:scale-95 hover:scale-105",
             ].join(" ")}
-            style={{ backgroundColor: "#007AFF" }}
+            style={{ backgroundColor: "#10B981" }}
           >
             <Volume2 className="h-4 w-4" aria-hidden="true" />
             <span className="text-sm">Speak</span>
@@ -70,7 +70,7 @@ export function ControlsCard({ language, setLanguage, sentence, onClear }: Props
             onClick={onClear}
             className={[
               "inline-flex items-center gap-2 rounded-md px-3 py-2",
-              "border border-[#007AFF]/30 text-[#007AFF] bg-white/70",
+              "border border-[#10B981]/30 text-[#10B981] bg-white/70",
               "transition-transform duration-150",
               "active:scale-95 hover:scale-105",
             ].join(" ")}
@@ -80,9 +80,7 @@ export function ControlsCard({ language, setLanguage, sentence, onClear }: Props
           </button>
         </div>
 
-        <p className="text-xs text-neutral-500">
-          Tip: Language affects future integrations (Translate/TTS). No AI is wired yet.
-        </p>
+        <p className="text-xs text-neutral-500">Tip: Language affects Translate/TTS.</p>
       </div>
     </ClearCard>
   )

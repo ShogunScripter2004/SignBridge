@@ -6,7 +6,7 @@ export function WelcomeSplash({ visible }: { visible: boolean }) {
       aria-hidden={!visible}
       className={[
         "fixed inset-0 z-50 flex items-center justify-center",
-        "bg-[#f6f6f6] text-neutral-900",
+        "bg-[#F5F3E7] text-neutral-900", // switch to beige background
         "transition-opacity duration-500",
         visible ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none",
       ].join(" ")}
@@ -17,7 +17,7 @@ export function WelcomeSplash({ visible }: { visible: boolean }) {
           "transition-transform duration-500",
           visible ? "scale-100" : "scale-95",
         ].join(" ")}
-        style={{ color: "#007AFF" }}
+        style={{ color: "#10B981" }} // switch to green accent
       >
         NAMASTE!
       </div>

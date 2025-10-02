@@ -1,10 +1,18 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { ClearCard } from "@/components/clear-card"
-import { CameraPlaceholder } from "@/components/camera-placeholder"
 import { ControlsCard } from "@/components/controls-card"
 import { cn } from "@/lib/utils"
+import * as tf from "@tensorflow/tfjs"
+import type { LayersModel, Tensor } from "@tensorflow/tfjs"
+
+type MPPoint = { x: number; y: number; z: number; visibility?: number }
+type MPResults = {
+  poseLandmarks?: MPPoint[]
+  leftHandLandmarks?: MPPoint[]
+  rightHandLandmarks?: MPPoint[]
+}
 
 export default function Page() {
   const [showWelcome, setShowWelcome] = useState(true)
@@ -14,26 +22,269 @@ export default function Page() {
   const [sentence, setSentence] = useState<string>("")
   const [language, setLanguage] = useState<"en" | "hi" | "mr">("en")
 
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const modelRef = useRef<LayersModel | null>(null)
+  const labelsRef = useRef<string[]>([])
+  const seqBufferRef = useRef<number[][]>([])
+  const lastVecRef = useRef<number[] | null>(null)
+  const pauseTimerRef = useRef<number | null>(null)
+  const rafRef = useRef<number | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const inputShapeRef = useRef<{ timesteps: number | null; dim: number | null }>({ timesteps: null, dim: null })
+
   useEffect(() => {
     const t = setTimeout(() => setShowWelcome(false), 1500)
     return () => clearTimeout(t)
   }, [])
 
-  // For gentle fade/slide of main content after splash
+  useEffect(() => {
+    let cancelled = false
+
+    function l1diff(a: number[], b: number[]) {
+      let sum = 0
+      const n = Math.min(a.length, b.length)
+      for (let i = 0; i < n; i++) sum += Math.abs(a[i] - b[i])
+      return sum / (n || 1)
+    }
+
+    function buildFeatureVector(results: MPResults): number[] {
+      const vec: number[] = []
+      const pushLms = (lms?: MPPoint[], includeVis = false) => {
+        if (!lms) return
+        for (const lm of lms) {
+          vec.push(lm.x ?? 0, lm.y ?? 0, lm.z ?? 0)
+          if (includeVis) vec.push(lm.visibility ?? 0)
+        }
+      }
+      // 33 pose (x,y,z,visibility), 21 LH (x,y,z), 21 RH (x,y,z)
+      pushLms(results.poseLandmarks, true)
+      pushLms(results.leftHandLandmarks, false)
+      pushLms(results.rightHandLandmarks, false)
+      return vec
+    }
+
+    async function predictFromBuffer() {
+      const model = modelRef.current
+      if (!model) return
+      const seq = seqBufferRef.current.slice()
+      const T = inputShapeRef.current.timesteps || 20
+      const D = inputShapeRef.current.dim || (seq[seq.length - 1]?.length ?? 0)
+      if (D === 0) return
+
+      const padded = new Array(T).fill(0).map((_, i) => {
+        const idx = Math.max(0, seq.length - T + i)
+        const frame = seq[idx] || []
+        const f = frame.slice(0, D)
+        while (f.length < D) f.push(0)
+        return f
+      })
+
+      const do2D = (model.inputs?.[0]?.shape?.length ?? 0) === 2
+      const input: Tensor = do2D ? tf.tensor(padded[padded.length - 1]).expandDims(0) : tf.tensor(padded).expandDims(0)
+      const logits = model.predict(input) as Tensor
+      const probs = tf.softmax(logits)
+      const data = await probs.data()
+      let index = 0
+      let max = Number.NEGATIVE_INFINITY
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] > max) {
+          max = data[i]
+          index = i
+        }
+      }
+      const label = labelsRef.current[index] ?? `class_${index}`
+      setCurrentWord(label)
+      if (max >= 0.6) {
+        setSentence((s) => (s ? s + " " + label : label))
+      }
+      tf.dispose([input, logits, probs])
+    }
+
+    function onResults(results: MPResults, ctx: CanvasRenderingContext2D) {
+      const video = videoRef.current!
+      const canvas = canvasRef.current!
+      ctx.save()
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      // draw video frame
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+      // simple landmarks overlay (greens + neutral gray)
+      const drawPts = (lms?: MPPoint[], color = "#10B981") => {
+        if (!lms) return
+        ctx.fillStyle = color
+        for (const lm of lms) {
+          const x = (lm.x ?? 0) * canvas.width
+          const y = (lm.y ?? 0) * canvas.height
+          ctx.beginPath()
+          ctx.arc(x, y, 2, 0, Math.PI * 2)
+          ctx.fill()
+        }
+      }
+      drawPts(results.leftHandLandmarks, "#10B981")
+      drawPts(results.rightHandLandmarks, "#16A34A")
+      drawPts(results.poseLandmarks, "#64748B") // slate-500 as neutral
+
+      ctx.restore()
+
+      // feature + movement heuristics
+      const vec = buildFeatureVector(results)
+      if (!vec.length) return
+      const prev = lastVecRef.current
+      const movement = prev ? l1diff(vec, prev) : 0
+      lastVecRef.current = vec
+
+      const seq = seqBufferRef.current
+      const maxLen = inputShapeRef.current.timesteps || 20
+      seq.push(vec)
+      if (seq.length > maxLen) seq.shift()
+
+      const MOVEMENT_THRESHOLD = 0.02
+      const PAUSE_MS = 600
+
+      if (movement > MOVEMENT_THRESHOLD) {
+        if (pauseTimerRef.current) {
+          clearTimeout(pauseTimerRef.current)
+          pauseTimerRef.current = null
+        }
+        return
+      }
+
+      if (!pauseTimerRef.current) {
+        pauseTimerRef.current = window.setTimeout(() => {
+          pauseTimerRef.current = null
+          // void ensures no unhandled promise
+          void predictFromBuffer()
+        }, PAUSE_MS)
+      }
+    }
+
+    async function setup() {
+      try {
+        // model + labels
+        const [model, labelsJson] = await Promise.all([
+          tf.loadLayersModel("/tfjs_model/model.json"),
+          fetch("/labels.json")
+            .then((r) => r.json())
+            .catch(() => []),
+        ])
+        if (cancelled) return
+        modelRef.current = model as LayersModel
+        labelsRef.current = Array.isArray(labelsJson) ? labelsJson : labelsJson?.labels || []
+
+        const shape = (model as LayersModel).inputs?.[0]?.shape
+        if (shape) {
+          inputShapeRef.current.timesteps = shape.length === 3 ? (shape[1] as number) : null
+          inputShapeRef.current.dim =
+            shape.length === 3 ? (shape[2] as number) : shape.length === 2 ? (shape[1] as number) : null
+        }
+
+        // camera
+        const video = videoRef.current!
+        const canvas = canvasRef.current!
+        const ctx = canvas.getContext("2d")!
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: false,
+        })
+        streamRef.current = stream
+        video.srcObject = stream
+        await video.play()
+        canvas.width = video.videoWidth || 640
+        canvas.height = video.videoHeight || 480
+
+        // holistic
+        let HolisticCtor: any = null
+        try {
+          const mod: any = await import("@mediapipe/holistic")
+          HolisticCtor = mod?.Holistic ?? mod?.default?.Holistic ?? mod?.default ?? null
+        } catch {
+          // ignore and fallback to CDN
+        }
+        if (!HolisticCtor) {
+          await import("https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js")
+          // @ts-ignore - provided by CDN/UMD
+          HolisticCtor = (window as any).Holistic
+        }
+        if (!HolisticCtor) {
+          throw new Error("Failed to load MediaPipe Holistic")
+        }
+
+        const holistic = new HolisticCtor({
+          locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`,
+        })
+        holistic.setOptions({
+          modelComplexity: 1,
+          smoothLandmarks: true,
+          refineFaceLandmarks: false,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5,
+          selfieMode: true,
+        })
+        holistic.onResults((res: MPResults) => onResults(res, ctx))
+
+        const loop = async () => {
+          if (cancelled) return
+          if (video.readyState >= 2) {
+            await holistic.send({ image: video })
+          }
+          rafRef.current = requestAnimationFrame(loop)
+        }
+        loop()
+      } catch (e) {
+        console.log("[v0] AI setup failed:", (e as Error).message)
+      }
+    }
+
+    setup()
+
+    return () => {
+      cancelled = true
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      if (pauseTimerRef.current) clearTimeout(pauseTimerRef.current)
+      streamRef.current?.getTracks().forEach((t) => t.stop())
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    async function translateIfNeeded() {
+      if (!sentence) return
+      try {
+        const res = await fetch("/api/translate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: sentence, target: language }),
+        })
+        const data = await res.json()
+        if (!cancelled && data?.translatedText) {
+          setSentence(data.translatedText)
+        }
+      } catch (e) {
+        console.log("[v0] Translate failed:", (e as Error).message)
+      }
+    }
+    translateIfNeeded()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [language])
+
   const contentClass = useMemo(
     () => cn("transition-all duration-500", showWelcome ? "opacity-0 translate-y-4" : "opacity-100 translate-y-0"),
     [showWelcome],
   )
 
   return (
-    <main className="min-h-dvh bg-[#f6f6f6] text-neutral-900">
+    <main className="min-h-dvh bg-[#F5F3E7] text-neutral-900">
       {/* Splash screen */}
-      {/* We inline here to avoid extra import and ensure the overlay is present */}
       <div
         aria-hidden={!showWelcome}
         className={[
           "fixed inset-0 z-50 flex items-center justify-center",
-          "bg-[#f6f6f6] text-neutral-900",
+          "bg-[#F5F3E7] text-neutral-900",
           "transition-opacity duration-500",
           showWelcome ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none",
         ].join(" ")}
@@ -44,7 +295,7 @@ export default function Page() {
             "transition-transform duration-500",
             showWelcome ? "scale-100" : "scale-95",
           ].join(" ")}
-          style={{ color: "#007AFF" }}
+          style={{ color: "#10B981" }}
         >
           NAMASTE!
         </div>
@@ -63,7 +314,12 @@ export default function Page() {
         <ClearCard className="mb-4">
           <div className="flex flex-col gap-3">
             <h2 className="text-sm font-medium text-neutral-700">Camera</h2>
-            <CameraPlaceholder />
+            <div className="relative w-full">
+              <div className="aspect-video w-full overflow-hidden rounded-lg border border-neutral-300 bg-white/50 backdrop-blur-sm">
+                <video ref={videoRef} className="h-full w-full object-cover" playsInline muted />
+                <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
+              </div>
+            </div>
           </div>
         </ClearCard>
 
@@ -82,28 +338,28 @@ export default function Page() {
             <button
               type="button"
               onClick={() => setCurrentWord("Hello")}
-              className="rounded-md border border-[#007AFF]/30 bg-white/70 px-2 py-1 text-xs text-[#007AFF] transition-transform duration-150 hover:scale-105 active:scale-95"
+              className="rounded-md border border-[#10B981]/30 bg-white/70 px-2 py-1 text-xs text-[#10B981] transition-transform duration-150 hover:scale-105 active:scale-95"
             >
               Set “Hello”
             </button>
             <button
               type="button"
               onClick={() => setCurrentWord("World")}
-              className="rounded-md border border-[#007AFF]/30 bg-white/70 px-2 py-1 text-xs text-[#007AFF] transition-transform duration-150 hover:scale-105 active:scale-95"
+              className="rounded-md border border-[#10B981]/30 bg-white/70 px-2 py-1 text-xs text-[#10B981] transition-transform duration-150 hover:scale-105 active:scale-95"
             >
               Set “World”
             </button>
             <button
               type="button"
               onClick={() => setCurrentWord("")}
-              className="rounded-md border border-[#007AFF]/30 bg-white/70 px-2 py-1 text-xs text-[#007AFF] transition-transform duration-150 hover:scale-105 active:scale-95"
+              className="rounded-md border border-[#10B981]/30 bg-white/70 px-2 py-1 text-xs text-[#10B981] transition-transform duration-150 hover:scale-105 active:scale-95"
             >
               Clear Word
             </button>
             <button
               type="button"
               onClick={() => setSentence((s) => (currentWord ? (s ? s + " " + currentWord : currentWord) : s))}
-              className="rounded-md bg-[#007AFF] px-2 py-1 text-xs text-white transition-transform duration-150 hover:scale-105 active:scale-95"
+              className="rounded-md bg-[#10B981] px-2 py-1 text-xs text-white transition-transform duration-150 hover:scale-105 active:scale-95"
             >
               Append to Sentence
             </button>
@@ -124,15 +380,20 @@ export default function Page() {
         {/* Controls */}
         <ControlsCard
           language={language}
-          setLanguage={setLanguage}
+          setLanguage={(lang) => {
+            // reset prediction on language switch to avoid confusion
+            setLanguage(lang)
+          }}
           sentence={sentence}
           onClear={() => {
             setCurrentWord("")
             setSentence("")
+            seqBufferRef.current = []
+            lastVecRef.current = null
           }}
         />
 
-        <footer className="mt-6 text-center text-xs text-neutral-400">Built for demo. Accent color: #007AFF</footer>
+        <footer className="mt-6 text-center text-xs text-neutral-400">Built for demo. Accent color: #10B981</footer>
       </div>
     </main>
   )
