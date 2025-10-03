@@ -64,6 +64,33 @@ export default function Page() {
       return vec
     }
 
+    function loadScript(src: string): Promise<void> {
+      return new Promise((resolve, reject) => {
+        // already loaded?
+        const existing = document.querySelector(`script[src="${src}"]`) as HTMLScriptElement | null
+        if (existing) {
+          // if Holistic is already on window, we're done
+          if ((window as any).Holistic) return resolve()
+          existing.addEventListener("load", () => resolve())
+          existing.addEventListener("error", () => reject(new Error(`Failed to load ${src}`)))
+          return
+        }
+        const s = document.createElement("script")
+        s.src = src
+        s.async = true
+        s.crossOrigin = "anonymous"
+        s.addEventListener("load", () => resolve())
+        s.addEventListener("error", () => reject(new Error(`Failed to load ${src}`)))
+        document.head.appendChild(s)
+      })
+    }
+
+    async function ensureHolisticViaCDN(): Promise<any> {
+      if ((window as any).Holistic) return (window as any).Holistic
+      await loadScript("https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js")
+      return (window as any).Holistic
+    }
+
     async function predictFromBuffer() {
       const model = modelRef.current
       if (!model) return
@@ -200,16 +227,13 @@ export default function Page() {
           const mod: any = await import("@mediapipe/holistic")
           HolisticCtor = mod?.Holistic ?? mod?.default?.Holistic ?? mod?.default ?? null
         } catch {
-          // ignore and fallback to CDN
+          // ignore; we'll try CDN next
         }
+
         if (!HolisticCtor) {
-          await import("https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js")
-          // @ts-ignore - provided by CDN/UMD
-          HolisticCtor = (window as any).Holistic
+          HolisticCtor = await ensureHolisticViaCDN()
         }
-        if (!HolisticCtor) {
-          throw new Error("Failed to load MediaPipe Holistic")
-        }
+        if (!HolisticCtor) throw new Error("Failed to load MediaPipe Holistic")
 
         const holistic = new HolisticCtor({
           locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${file}`,
