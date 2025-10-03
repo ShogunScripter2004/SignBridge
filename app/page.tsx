@@ -13,14 +13,17 @@ type MPResults = {
   leftHandLandmarks?: MPPoint[]
   rightHandLandmarks?: MPPoint[]
 }
+type Language = "en" | "hi" | "mr";
 
 export default function Page() {
   const [showWelcome, setShowWelcome] = useState(true)
 
-  // AI State placeholders
+  // AI & UI State
   const [currentWord, setCurrentWord] = useState<string>("")
   const [sentence, setSentence] = useState<string>("")
-  const [language, setLanguage] = useState<"en" | "hi" | "mr">("en")
+  const [language, setLanguage] = useState<Language>("en")
+  const [translatedSentence, setTranslatedSentence] = useState<string>("")
+  const [isTranslating, setIsTranslating] = useState(false)
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -49,27 +52,20 @@ export default function Page() {
     }
 
     function buildFeatureVector(results: MPResults): number[] {
-      const vec: number[] = []
-      const pushLms = (lms?: MPPoint[], includeVis = false) => {
-        if (!lms) return
-        for (const lm of lms) {
-          vec.push(lm.x ?? 0, lm.y ?? 0, lm.z ?? 0)
-          if (includeVis) vec.push(lm.visibility ?? 0)
-        }
+        const vec: number[] = []
+        const fillEmpty = (count: number) => new Array(count * 3).fill(0);
+        
+        const pose_xyz = results.poseLandmarks ? results.poseLandmarks.flatMap(lm => [lm.x, lm.y, lm.z]) : fillEmpty(33);
+        const lh = results.leftHandLandmarks ? results.leftHandLandmarks.flatMap(lm => [lm.x, lm.y, lm.z]) : fillEmpty(21);
+        const rh = results.rightHandLandmarks ? results.rightHandLandmarks.flatMap(lm => [lm.x, lm.y, lm.z]) : fillEmpty(21);
+        
+        return [...pose_xyz, ...lh, ...rh];
       }
-      // 33 pose (x,y,z,visibility), 21 LH (x,y,z), 21 RH (x,y,z)
-      pushLms(results.poseLandmarks, true)
-      pushLms(results.leftHandLandmarks, false)
-      pushLms(results.rightHandLandmarks, false)
-      return vec
-    }
 
     function loadScript(src: string): Promise<void> {
       return new Promise((resolve, reject) => {
-        // already loaded?
         const existing = document.querySelector(`script[src="${src}"]`) as HTMLScriptElement | null
         if (existing) {
-          // if Holistic is already on window, we're done
           if ((window as any).Holistic) return resolve()
           existing.addEventListener("load", () => resolve())
           existing.addEventListener("error", () => reject(new Error(`Failed to load ${src}`)))
@@ -94,36 +90,35 @@ export default function Page() {
     async function predictFromBuffer() {
       const model = modelRef.current
       if (!model) return
+
       const seq = seqBufferRef.current.slice()
-      const T = inputShapeRef.current.timesteps || 20
-      const D = inputShapeRef.current.dim || (seq[seq.length - 1]?.length ?? 0)
-      if (D === 0) return
+      const T = inputShapeRef.current.timesteps || 45
+      const D = inputShapeRef.current.dim || 258
+      if (D === 0 || seq.length < 10) return
 
-      const padded = new Array(T).fill(0).map((_, i) => {
-        const idx = Math.max(0, seq.length - T + i)
-        const frame = seq[idx] || []
-        const f = frame.slice(0, D)
-        while (f.length < D) f.push(0)
-        return f
-      })
+      const padded = new Array(T).fill(0).map(() => new Array(D).fill(0));
+      const start = Math.max(0, T - seq.length);
+      for (let i = 0; i < seq.length && i < T; i++) {
+        padded[start + i] = seq[i];
+      }
 
-      const do2D = (model.inputs?.[0]?.shape?.length ?? 0) === 2
-      const input: Tensor = do2D ? tf.tensor(padded[padded.length - 1]).expandDims(0) : tf.tensor(padded).expandDims(0)
+      const input: Tensor = tf.tensor(padded).expandDims(0)
       const logits = model.predict(input) as Tensor
       const probs = tf.softmax(logits)
       const data = await probs.data()
-      let index = 0
-      let max = Number.NEGATIVE_INFINITY
-      for (let i = 0; i < data.length; i++) {
-        if (data[i] > max) {
-          max = data[i]
-          index = i
-        }
+      
+      const maxProb = Math.max(...data)
+      if(maxProb < 0.7) { // Confidence threshold
+        tf.dispose([input, logits, probs])
+        return
       }
-      const label = labelsRef.current[index] ?? `class_${index}`
-      setCurrentWord(label)
-      if (max >= 0.6) {
-        setSentence((s) => (s ? s + " " + label : label))
+
+      const index = data.indexOf(maxProb)
+      const label = labelsRef.current[index]
+      
+      if (label && label !== currentWord) {
+          setCurrentWord(label)
+          setSentence((s) => (s ? s + " " + label : label))
       }
       tf.dispose([input, logits, probs])
     }
@@ -133,10 +128,8 @@ export default function Page() {
       const canvas = canvasRef.current!
       ctx.save()
       ctx.clearRect(0, 0, canvas.width, canvas.height)
-      // draw video frame
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
 
-      // simple landmarks overlay (greens + neutral gray)
       const drawPts = (lms?: MPPoint[], color = "#10B981") => {
         if (!lms) return
         ctx.fillStyle = color
@@ -150,24 +143,25 @@ export default function Page() {
       }
       drawPts(results.leftHandLandmarks, "#10B981")
       drawPts(results.rightHandLandmarks, "#16A34A")
-      drawPts(results.poseLandmarks, "#64748B") // slate-500 as neutral
+      // We don't need to draw pose landmarks for the final UI
+      // drawPts(results.poseLandmarks, "#64748B")
 
       ctx.restore()
 
-      // feature + movement heuristics
       const vec = buildFeatureVector(results)
       if (!vec.length) return
+
       const prev = lastVecRef.current
-      const movement = prev ? l1diff(vec, prev) : 0
+      const movement = prev ? l1diff(vec, prev) : 1
       lastVecRef.current = vec
 
       const seq = seqBufferRef.current
-      const maxLen = inputShapeRef.current.timesteps || 20
+      const maxLen = inputShapeRef.current.timesteps || 45
       seq.push(vec)
       if (seq.length > maxLen) seq.shift()
 
       const MOVEMENT_THRESHOLD = 0.02
-      const PAUSE_MS = 600
+      const PAUSE_MS = 800
 
       if (movement > MOVEMENT_THRESHOLD) {
         if (pauseTimerRef.current) {
@@ -180,7 +174,6 @@ export default function Page() {
       if (!pauseTimerRef.current) {
         pauseTimerRef.current = window.setTimeout(() => {
           pauseTimerRef.current = null
-          // void ensures no unhandled promise
           void predictFromBuffer()
         }, PAUSE_MS)
       }
@@ -188,25 +181,22 @@ export default function Page() {
 
     async function setup() {
       try {
-        // model + labels
         const [model, labelsJson] = await Promise.all([
           tf.loadLayersModel("/tfjs_model/model.json"),
           fetch("/labels.json")
             .then((r) => r.json())
-            .catch(() => []),
+            .catch(() => ({})),
         ])
         if (cancelled) return
         modelRef.current = model as LayersModel
-        labelsRef.current = Array.isArray(labelsJson) ? labelsJson : labelsJson?.labels || []
+        labelsRef.current = Object.values(labelsJson)
 
         const shape = (model as LayersModel).inputs?.[0]?.shape
         if (shape) {
           inputShapeRef.current.timesteps = shape.length === 3 ? (shape[1] as number) : null
-          inputShapeRef.current.dim =
-            shape.length === 3 ? (shape[2] as number) : shape.length === 2 ? (shape[1] as number) : null
+          inputShapeRef.current.dim = shape.length === 3 ? (shape[2] as number) : null
         }
 
-        // camera
         const video = videoRef.current!
         const canvas = canvasRef.current!
         const ctx = canvas.getContext("2d")!
@@ -221,14 +211,11 @@ export default function Page() {
         canvas.width = video.videoWidth || 640
         canvas.height = video.videoHeight || 480
 
-        // holistic
         let HolisticCtor: any = null
         try {
           const mod: any = await import("@mediapipe/holistic")
           HolisticCtor = mod?.Holistic ?? mod?.default?.Holistic ?? mod?.default ?? null
-        } catch {
-          // ignore; we'll try CDN next
-        }
+        } catch {}
 
         if (!HolisticCtor) {
           HolisticCtor = await ensureHolisticViaCDN()
@@ -241,7 +228,6 @@ export default function Page() {
         holistic.setOptions({
           modelComplexity: 1,
           smoothLandmarks: true,
-          refineFaceLandmarks: false,
           minDetectionConfidence: 0.5,
           minTrackingConfidence: 0.5,
           selfieMode: true,
@@ -274,7 +260,11 @@ export default function Page() {
   useEffect(() => {
     let cancelled = false
     async function translateIfNeeded() {
-      if (!sentence) return
+      if (!sentence || language === 'en') {
+        setTranslatedSentence(sentence) // If English is selected, just show the original sentence
+        return
+      }
+      setIsTranslating(true)
       try {
         const res = await fetch("/api/translate", {
           method: "POST",
@@ -283,18 +273,19 @@ export default function Page() {
         })
         const data = await res.json()
         if (!cancelled && data?.translatedText) {
-          setSentence(data.translatedText)
+          setTranslatedSentence(data.translatedText) // Correctly update the dedicated translation state
         }
       } catch (e) {
         console.log("[v0] Translate failed:", (e as Error).message)
+      } finally {
+        if (!cancelled) setIsTranslating(false)
       }
     }
     translateIfNeeded()
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [language])
+  }, [sentence, language])
 
   const contentClass = useMemo(
     () => cn("transition-all duration-500", showWelcome ? "opacity-0 translate-y-4" : "opacity-100 translate-y-0"),
@@ -306,19 +297,19 @@ export default function Page() {
       {/* Splash screen */}
       <div
         aria-hidden={!showWelcome}
-        className={[
+        className={cn(
           "fixed inset-0 z-50 flex items-center justify-center",
           "bg-[#F5F3E7] text-neutral-900",
           "transition-opacity duration-500",
           showWelcome ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none",
-        ].join(" ")}
+        )}
       >
         <div
-          className={[
+          className={cn(
             "text-4xl font-semibold tracking-wide select-none",
             "transition-transform duration-500",
             showWelcome ? "scale-100" : "scale-95",
-          ].join(" ")}
+          )}
           style={{ color: "#10B981" }}
         >
           NAMASTE!
@@ -330,7 +321,7 @@ export default function Page() {
         <header className="mb-4">
           <h1 className="text-balance text-center text-2xl font-semibold">Sign Bridge</h1>
           <p className="mt-1 text-center text-sm text-neutral-500">
-            Minimal “Clear Card” UI. AI logic will be added later.
+            Real-Time ISL Translator
           </p>
         </header>
 
@@ -340,7 +331,7 @@ export default function Page() {
             <h2 className="text-sm font-medium text-neutral-700">Camera</h2>
             <div className="relative w-full">
               <div className="aspect-video w-full overflow-hidden rounded-lg border border-neutral-300 bg-white/50 backdrop-blur-sm">
-                <video ref={videoRef} className="h-full w-full object-cover" playsInline muted />
+                <video ref={videoRef} className="h-full w-full object-cover" playsInline muted style={{transform: 'scaleX(-1)'}} />
                 <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
               </div>
             </div>
@@ -351,74 +342,50 @@ export default function Page() {
         <ClearCard className="mb-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-medium text-neutral-700">Current Word</h2>
-            <span className="text-sm text-neutral-500">Live preview</span>
+            <span className="text-sm text-neutral-500">Live</span>
           </div>
-          <div className="mt-2 min-h-10 rounded-md bg-white/70 px-3 py-2 text-neutral-900 backdrop-blur">
+          <div className="mt-2 min-h-10 flex items-center justify-center rounded-md bg-white/70 px-3 py-2 text-xl font-semibold backdrop-blur">
             {currentWord || <span className="text-neutral-400">Awaiting prediction…</span>}
-          </div>
-
-          {/* Demo controls to emulate incoming prediction (for now) */}
-          <div className="mt-3 flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={() => setCurrentWord("Hello")}
-              className="rounded-md border border-[#10B981]/30 bg-white/70 px-2 py-1 text-xs text-[#10B981] transition-transform duration-150 hover:scale-105 active:scale-95"
-            >
-              Set “Hello”
-            </button>
-            <button
-              type="button"
-              onClick={() => setCurrentWord("World")}
-              className="rounded-md border border-[#10B981]/30 bg-white/70 px-2 py-1 text-xs text-[#10B981] transition-transform duration-150 hover:scale-105 active:scale-95"
-            >
-              Set “World”
-            </button>
-            <button
-              type="button"
-              onClick={() => setCurrentWord("")}
-              className="rounded-md border border-[#10B981]/30 bg-white/70 px-2 py-1 text-xs text-[#10B981] transition-transform duration-150 hover:scale-105 active:scale-95"
-            >
-              Clear Word
-            </button>
-            <button
-              type="button"
-              onClick={() => setSentence((s) => (currentWord ? (s ? s + " " + currentWord : currentWord) : s))}
-              className="rounded-md bg-[#10B981] px-2 py-1 text-xs text-white transition-transform duration-150 hover:scale-105 active:scale-95"
-            >
-              Append to Sentence
-            </button>
           </div>
         </ClearCard>
 
-        {/* Full Sentence */}
+        {/* Full Sentence (English) */}
         <ClearCard className="mb-4">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-medium text-neutral-700">Full Sentence</h2>
-            <span className="text-sm text-neutral-500">Aggregated</span>
+            <h2 className="text-sm font-medium text-neutral-700">Detected Sentence (English)</h2>
           </div>
           <div className="mt-2 min-h-14 rounded-md bg-white/70 px-3 py-2 text-neutral-900 backdrop-blur">
             {sentence || <span className="text-neutral-400">Your sentence will build here…</span>}
+          </div>
+        </ClearCard>
+        
+        {/* Translated Sentence */}
+        <ClearCard className="mb-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-medium text-neutral-700">Translation</h2>
+          </div>
+          <div className="mt-2 min-h-14 rounded-md bg-white/70 px-3 py-2 text-neutral-900 backdrop-blur">
+            {isTranslating ? <span className="text-neutral-400">Translating...</span> : (translatedSentence || <span className="text-neutral-400">Select a language to translate.</span>)}
           </div>
         </ClearCard>
 
         {/* Controls */}
         <ControlsCard
           language={language}
-          setLanguage={(lang) => {
-            // reset prediction on language switch to avoid confusion
-            setLanguage(lang)
-          }}
-          sentence={sentence}
+          setLanguage={(lang) => setLanguage(lang)}
+          sentence={translatedSentence || sentence}
           onClear={() => {
             setCurrentWord("")
             setSentence("")
+            setTranslatedSentence("")
             seqBufferRef.current = []
             lastVecRef.current = null
           }}
         />
 
-        <footer className="mt-6 text-center text-xs text-neutral-400">Built for demo. Accent color: #10B981</footer>
+        <footer className="mt-6 text-center text-xs text-neutral-400">Sign Bridge Project</footer>
       </div>
     </main>
   )
 }
+
